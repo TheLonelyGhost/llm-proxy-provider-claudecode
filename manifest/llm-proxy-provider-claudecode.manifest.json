@@ -1,0 +1,24 @@
+{
+  "name": "claudecode",
+  "version": "0.1.0",
+  "protocol_version": 1,
+  "port_env_var": "LLM_PROXY_PLUGIN_PORT",
+  "endpoints": {
+    "health": "/healthz",
+    "reload": "/management/reload"
+  },
+  "tools": [
+    {
+      "name": "login",
+      "description": "Sign in to Claude Code with your Claude subscription (runs claude auth login)"
+    },
+    {
+      "name": "list-models",
+      "description": "List the Claude models available to the logged-in account"
+    },
+    {
+      "name": "budget",
+      "description": "Report Claude plan usage and usage-credit spend as JSON"
+    }
+  ]
+}

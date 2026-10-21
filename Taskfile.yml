@@ -1,0 +1,183 @@
+# https://taskfile.dev
+version: "3"
+
+vars:
+  BIN: llm-proxy-provider-claudecode
+  MODULE: github.com/thelonelyghost/llm-proxy-provider-claudecode
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  LDFLAGS: -s -w -X {{.MODULE}}/internal/cli.version={{.VERSION}}
+  # FIPS 140-3 Go Cryptographic Module version (Go 1.24+). The alias resolves
+  # through $(go env GOROOT)/lib/fips140/<alias>.txt.
+  FIPS_MODULE: certified
+  # Set each value inline in the command. Task keeps a variable that the
+  # process environment already sets and ignores a task `env:` value.
+  # Release binaries are static.
+  RELEASE_ENV: CGO_ENABLED=0 GOFIPS140={{.FIPS_MODULE}}
+  # Fail any test that calls a cryptographic algorithm outside FIPS 140-3.
+  TEST_ENV: GOFIPS140={{.FIPS_MODULE}} GODEBUG=fips140=only
+  COVERAGE_MIN: 80
+  COVERAGE_FILE: coverage.out
+  GOLANGCI_CUSTOM: ./bin/custom-gcl
+  GOVULNCHECK_VERSION: v1.9.0
+  INSTALL_DIR:
+    sh: echo "${INSTALL_DIR:-$HOME/.local/bin}"
+  # llm-proxy plugin packaging. The manifest version is the release version.
+  PLUGIN_NAME: claudecode
+  MANIFEST: manifest/{{.BIN}}.manifest.json
+  PLUGIN_VERSION:
+    sh: >-
+      sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' manifest/llm-proxy-provider-claudecode.manifest.json
+  PLATFORMS: linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+  # Matches llm-proxy's plugin cache: $LLM_PROXY_CACHE_DIR, else
+  # ${XDG_CACHE_HOME:-~/.cache}/llm-proxy.
+  PLUGIN_CACHE:
+    sh: echo "${LLM_PROXY_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/llm-proxy}"
+
+tasks:
+  default:
+    desc: List available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  build:
+    desc: Build ./bin/{{.BIN}} (static, FIPS 140-3 module {{.FIPS_MODULE}})
+    # No sources/generates: a Taskfile or toolchain change must rebuild.
+    # The Go build cache keeps a rebuild fast.
+    cmds:
+      - '{{.RELEASE_ENV}} go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/{{.BIN}} ./cmd/{{.BIN}}'
+
+  build:verify:
+    desc: Fail unless ./bin/{{.BIN}} is static and runs the FIPS 140-3 module {{.FIPS_MODULE}}
+    deps: [build]
+    cmds:
+      - |
+        alias_file="$(go env GOROOT)/lib/fips140/{{.FIPS_MODULE}}.txt"
+        if [ -f "$alias_file" ]; then want=$(cat "$alias_file"); else want="{{.FIPS_MODULE}}"; fi
+        info=$(go version -m bin/{{.BIN}})
+        printf '%s\n' "$info" | grep -Eq 'CGO_ENABLED=0$' \
+          || { echo "bin/{{.BIN}} is not a static build" >&2; exit 1; }
+        printf '%s\n' "$info" | grep -Eq "GOFIPS140=${want}\$" \
+          || { echo "bin/{{.BIN}} does not use FIPS 140-3 module ${want}" >&2; exit 1; }
+        printf '%s\n' "$info" | grep -Eq 'DefaultGODEBUG=([^ ]*,)?fips140=on(,|$)' \
+          || { echo "bin/{{.BIN}} does not turn on FIPS 140-3 mode at run time" >&2; exit 1; }
+        printf '%s\n' "$info" | grep -E 'CGO_ENABLED|GOFIPS140|DefaultGODEBUG'
+
+  install:
+    desc: Install {{.BIN}} into ~/.local/bin (override with INSTALL_DIR=...)
+    cmds:
+      - mkdir -p "{{.INSTALL_DIR}}"
+      - '{{.RELEASE_ENV}} go build -trimpath -ldflags "{{.LDFLAGS}}" -o "{{.INSTALL_DIR}}/{{.BIN}}" ./cmd/{{.BIN}}'
+      - 'echo "installed {{.BIN}} {{.VERSION}} to {{.INSTALL_DIR}}/{{.BIN}}"'
+
+  run:
+    desc: Run {{.BIN}} from source (task run -- ARGS)
+    cmds:
+      - '{{.RELEASE_ENV}} go run -ldflags "{{.LDFLAGS}}" ./cmd/{{.BIN}} {{.CLI_ARGS}}'
+
+  test:
+    desc: Run unit tests with the race detector in strict FIPS mode and write {{.COVERAGE_FILE}}
+    cmds:
+      # The race detector needs cgo on Linux. Test binaries are not shipped.
+      - CGO_ENABLED=1 {{.TEST_ENV}} go test -race -covermode=atomic -coverpkg=./... -coverprofile={{.COVERAGE_FILE}} ./...
+
+  test:release:
+    desc: Run unit tests in the release configuration (CGO_ENABLED=0, strict FIPS mode)
+    cmds:
+      - CGO_ENABLED=0 {{.TEST_ENV}} go test ./...
+
+  coverage:
+    desc: Fail unless total statement coverage is >= {{.COVERAGE_MIN}}%
+    deps: [test]
+    cmds:
+      - |
+        total=$(go tool cover -func={{.COVERAGE_FILE}} | awk '/^total:/ { sub(/%/, "", $NF); print $NF }')
+        echo "total coverage: ${total}% (minimum {{.COVERAGE_MIN}}%)"
+        awk -v got="$total" -v min="{{.COVERAGE_MIN}}" 'BEGIN { exit (got + 0 >= min + 0) ? 0 : 1 }' \
+          || { echo "coverage ${total}% is below the required {{.COVERAGE_MIN}}%" >&2; exit 1; }
+
+  coverage:html:
+    desc: Open an HTML coverage report
+    deps: [test]
+    cmds:
+      - go tool cover -html={{.COVERAGE_FILE}} -o coverage.html
+      - 'echo "wrote coverage.html"'
+
+  lint:build:
+    desc: Build the custom golangci-lint binary with the nilaway plugin
+    sources:
+      - .custom-gcl.yml
+    generates:
+      - "{{.GOLANGCI_CUSTOM}}"
+    preconditions:
+      - sh: command -v golangci-lint
+        msg: "golangci-lint v2 is required to bootstrap the custom build: https://golangci-lint.run/docs/welcome/install/"
+    cmds:
+      - golangci-lint custom
+
+  lint:
+    desc: Run golangci-lint (standard linters + nilaway)
+    deps: [lint:build]
+    cmds:
+      - "{{.GOLANGCI_CUSTOM}} run ./..."
+
+  fmt:
+    desc: Format Go sources with gofmt and goimports via golangci-lint
+    deps: [lint:build]
+    cmds:
+      - "{{.GOLANGCI_CUSTOM}} fmt ./..."
+
+  vuln:
+    desc: Scan dependencies and call graph for known vulnerabilities
+    cmds:
+      # GOFIPS140 makes govulncheck scan the FIPS module snapshot that ships.
+      - GOFIPS140={{.FIPS_MODULE}} go run golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}} ./...
+
+  tidy:
+    desc: Verify go.mod and go.sum are tidy
+    cmds:
+      - go mod tidy -diff
+
+  package:
+    desc: Build release archives for every platform into dist/ (static, FIPS 140-3 module {{.FIPS_MODULE}})
+    cmds:
+      - rm -rf dist
+      - mkdir -p dist
+      - for: { var: PLATFORMS, split: " " }
+        cmd: |
+          item="{{.ITEM}}"; os="${item%/*}"; arch="${item#*/}"
+          ext=""; if [ "$os" = windows ]; then ext=".exe"; fi
+          stage="dist/stage-${os}-${arch}"
+          mkdir -p "$stage"
+          GOOS="$os" GOARCH="$arch" {{.RELEASE_ENV}} go build -trimpath \
+            -ldflags "-s -w -X {{.MODULE}}/internal/cli.version=v{{.PLUGIN_VERSION}}" \
+            -o "$stage/{{.BIN}}${ext}" ./cmd/{{.BIN}}
+          cp {{.MANIFEST}} "$stage/"
+          tar -czf "dist/{{.BIN}}_{{.PLUGIN_VERSION}}_${os}_${arch}.tar.gz" -C "$stage" "{{.BIN}}${ext}" "{{.BIN}}.manifest.json"
+          rm -rf "$stage"
+      - |
+        cd dist
+        if command -v sha256sum >/dev/null 2>&1; then sha256sum ./*.tar.gz; else shasum -a 256 ./*.tar.gz; fi \
+          | sed 's| \./| |' > SHA256SUMS
+        cat SHA256SUMS
+
+  sideload:
+    desc: Install ./bin/{{.BIN}} and its manifest into llm-proxy's plugin cache for local testing
+    deps: [build]
+    vars:
+      DEST: "{{.PLUGIN_CACHE}}/plugins/thelonelyghost/{{.PLUGIN_NAME}}/{{.PLUGIN_VERSION}}/{{OS}}_{{ARCH}}"
+    cmds:
+      - mkdir -p "{{.DEST}}"
+      - install -m 0755 bin/{{.BIN}} "{{.DEST}}/{{.BIN}}"
+      - install -m 0644 {{.MANIFEST}} "{{.DEST}}/{{.BIN}}.manifest.json"
+      - 'echo "sideloaded {{.BIN}} {{.PLUGIN_VERSION}} to {{.DEST}}"'
+
+  quality-gate:
+    desc: "Everything CI requires: tidy, lint, vulnerability scan, static FIPS build, tests, >= {{.COVERAGE_MIN}}% coverage"
+    deps: [tidy, lint, vuln, build:verify, test:release, coverage]
+
+  clean:
+    desc: Remove build and coverage artifacts
+    cmds:
+      - rm -rf bin dist coverage.out coverage.html

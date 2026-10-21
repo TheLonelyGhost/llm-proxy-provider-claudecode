@@ -1,0 +1,11 @@
+# Custom golangci-lint build that bundles NilAway as a module plugin.
+# Build it with `task lint:build` (runs `golangci-lint custom`); the result is
+# ./bin/custom-gcl and is what `task lint` executes.
+# See https://github.com/uber-go/nilaway#golangci-lint--v1570
+version: v2.14.0
+name: custom-gcl
+destination: ./bin
+plugins:
+  - module: "go.uber.org/nilaway"
+    import: "go.uber.org/nilaway/cmd/gclplugin"
+    version: v0.0.0-20260918162853-acb8859b9031
