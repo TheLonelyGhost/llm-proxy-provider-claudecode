@@ -60,6 +60,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            --title "Release $GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
             --generate-notes \
             dist/*.tar.gz dist/SHA256SUMS
