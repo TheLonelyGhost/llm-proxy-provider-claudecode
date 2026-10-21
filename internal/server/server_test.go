@@ -223,7 +223,7 @@ func TestChatNonStreaming(t *testing.T) {
 	if !strings.HasPrefix(c.ID, "chatcmpl-") || c.Model != "haiku" || c.Choices[0].Message.Content != "Hello" || c.Choices[0].FinishReason != "stop" || c.Usage.TotalTokens != 5 {
 		t.Errorf("completion = %s", body)
 	}
-	if got := f.request(); got.SystemPrompt != "S" || got.Prompt != "hi" || got.Effort != "high" || got.Model != "haiku" {
+	if got := f.request(); got.SystemPrompt != "S" || len(got.Turns) != 1 || got.Turns[0].Text != "hi" || got.Effort != "high" || got.Model != "haiku" {
 		t.Errorf("driver got %+v", got)
 	}
 }

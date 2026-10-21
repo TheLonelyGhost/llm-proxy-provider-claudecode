@@ -45,6 +45,11 @@ func readRecord(t *testing.T, path string) record {
 	return r
 }
 
+// ask is a conversation of one user message.
+func ask(text string) []Turn {
+	return []Turn{{Role: RoleUser, Text: text}}
+}
+
 func collect(events *[]Event) func(Event) error {
 	return func(ev Event) error {
 		*events = append(*events, ev)
@@ -86,7 +91,7 @@ func TestChildEnvDropsOverrides(t *testing.T) {
 func TestChatStreamsText(t *testing.T) {
 	d, recPath := fakeDriver(t, "text")
 	var events []Event
-	res, err := d.Chat(context.Background(), Request{Model: "haiku", Effort: "low", SystemPrompt: "Be brief.", Prompt: "hi"}, collect(&events))
+	res, err := d.Chat(context.Background(), Request{Model: "haiku", Effort: "low", SystemPrompt: "Be brief.", Turns: ask("hi")}, collect(&events))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +142,50 @@ func containsSeq(args, seq []string) bool {
 	return false
 }
 
+func TestChatReplaysHistory(t *testing.T) {
+	d, recPath := fakeDriver(t, "text")
+	turns := []Turn{
+		{Role: RoleUser, Text: "My name is Ada."},
+		{Role: RoleAssistant, Text: "Checking.", ToolCalls: []ToolCall{{ID: "call_1", Name: "get_time", Input: json.RawMessage(`{"tz":"UTC"}`)}}},
+		{Role: RoleUser, ToolResults: []ToolResult{{ToolCallID: "call_1", Content: "12:00"}}, Text: "And my name?"},
+	}
+	if _, err := d.Chat(context.Background(), Request{Model: "haiku", Turns: turns}, func(Event) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	rec := readRecord(t, recPath)
+	got, _ := json.Marshal(rec.Frames)
+	want := `[` +
+		`{"client_composed":true,"message":{"content":[{"text":"My name is Ada.","type":"text"}],"role":"user"},"parent_tool_use_id":null,"session_id":"","shouldQuery":false,"type":"user"},` +
+		`{"message":{"content":[{"text":"Checking.","type":"text"},{"id":"call_1","input":{"tz":"UTC"},"name":"mcp__c__get_time","type":"tool_use"}],"id":"msg_replay_1","role":"assistant","type":"message"},"parent_tool_use_id":null,"session_id":"","type":"assistant"},` +
+		`{"client_composed":true,"message":{"content":[{"content":"12:00","tool_use_id":"call_1","type":"tool_result"},{"text":"And my name?","type":"text"}],"role":"user"},"parent_tool_use_id":null,"session_id":"","type":"user"}` +
+		`]`
+	if string(got) != want {
+		t.Errorf("frames =\n%s\nwant\n%s", got, want)
+	}
+	if rec.Prompt != "And my name?" {
+		t.Errorf("querying frame text = %q", rec.Prompt)
+	}
+}
+
+func TestChatHistoryAckError(t *testing.T) {
+	d, _ := fakeDriver(t, "ack_error")
+	turns := []Turn{{Role: RoleUser, Text: "a"}, {Role: RoleAssistant, Text: "b"}, {Role: RoleUser, Text: "c"}}
+	_, err := d.Chat(context.Background(), Request{Model: "haiku", Turns: turns}, func(Event) error { return nil })
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || !strings.Contains(ue.Message, "replaying conversation history failed") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestChatNeedsFinalUserTurn(t *testing.T) {
+	d := &Driver{Path: os.Args[0], WorkDir: t.TempDir()}
+	for _, turns := range [][]Turn{nil, {{Role: RoleUser, Text: "a"}, {Role: RoleAssistant, Text: "b"}}} {
+		if _, err := d.Chat(context.Background(), Request{Turns: turns}, func(Event) error { return nil }); err == nil {
+			t.Errorf("turns %+v: want an error", turns)
+		}
+	}
+}
+
 func TestChatScenarios(t *testing.T) {
 	tests := []struct {
 		scenario string
@@ -152,7 +201,7 @@ func TestChatScenarios(t *testing.T) {
 		t.Run(tt.scenario, func(t *testing.T) {
 			d, _ := fakeDriver(t, tt.scenario)
 			var events []Event
-			res, err := d.Chat(context.Background(), Request{Model: "haiku", Prompt: "hi"}, collect(&events))
+			res, err := d.Chat(context.Background(), Request{Model: "haiku", Turns: ask("hi")}, collect(&events))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -174,7 +223,7 @@ func TestChatStopsAtToolCalls(t *testing.T) {
 		{Name: "get_date", Description: "date", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}
 	var events []Event
-	res, err := d.Chat(context.Background(), Request{Model: "opus", Prompt: "time?", Tools: tools}, collect(&events))
+	res, err := d.Chat(context.Background(), Request{Model: "opus", Turns: ask("time?"), Tools: tools}, collect(&events))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +266,7 @@ func TestChatErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.scenario, func(t *testing.T) {
 			d, _ := fakeDriver(t, tt.scenario)
-			_, err := d.Chat(context.Background(), Request{Model: "haiku", Prompt: "hi"}, func(Event) error { return nil })
+			_, err := d.Chat(context.Background(), Request{Model: "haiku", Turns: ask("hi")}, func(Event) error { return nil })
 			var ue *UpstreamError
 			if !errors.As(err, &ue) {
 				t.Fatalf("err = %v, want *UpstreamError", err)
@@ -235,7 +284,7 @@ func TestChatErrors(t *testing.T) {
 func TestChatEmitErrorStops(t *testing.T) {
 	d, _ := fakeDriver(t, "hang")
 	stop := errors.New("client went away")
-	_, err := d.Chat(context.Background(), Request{Model: "haiku", Prompt: "hi"}, func(Event) error { return stop })
+	_, err := d.Chat(context.Background(), Request{Model: "haiku", Turns: ask("hi")}, func(Event) error { return stop })
 	if !errors.Is(err, stop) {
 		t.Fatalf("err = %v, want %v", err, stop)
 	}
@@ -245,7 +294,7 @@ func TestChatContextCancelKillsCLI(t *testing.T) {
 	d, _ := fakeDriver(t, "hang")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, err := d.Chat(ctx, Request{Model: "haiku", Prompt: "hi"}, func(Event) error {
+	_, err := d.Chat(ctx, Request{Model: "haiku", Turns: ask("hi")}, func(Event) error {
 		cancel()
 		return nil
 	})
@@ -258,7 +307,7 @@ func TestCLINotFound(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-such-claude")
 	d := &Driver{Path: missing, WorkDir: t.TempDir()}
 	ctx := context.Background()
-	_, chatErr := d.Chat(ctx, Request{Model: "haiku", Prompt: "hi"}, func(Event) error { return nil })
+	_, chatErr := d.Chat(ctx, Request{Model: "haiku", Turns: ask("hi")}, func(Event) error { return nil })
 	_, catErr := d.Catalogue(ctx)
 	_, usageErr := d.Usage(ctx)
 	_, authErr := d.AuthStatus(ctx)
@@ -272,7 +321,7 @@ func TestCLINotFound(t *testing.T) {
 
 func TestChatNeedsWorkDir(t *testing.T) {
 	d := &Driver{Path: os.Args[0], WorkDir: filepath.Join(t.TempDir(), "missing")}
-	if _, err := d.Chat(context.Background(), Request{}, func(Event) error { return nil }); err == nil {
+	if _, err := d.Chat(context.Background(), Request{Turns: ask("hi")}, func(Event) error { return nil }); err == nil {
 		t.Fatal("want an error for a missing work dir")
 	}
 }

@@ -37,6 +37,8 @@ type record struct {
 	SystemPrompt string   `json:"system_prompt"`
 	Prompt       string   `json:"prompt"`
 	Tools        []string `json:"tools"`
+	// Frames are the user and assistant frames received, in order.
+	Frames []map[string]any `json:"frames"`
 }
 
 var fakeModels = []map[string]any{
@@ -128,9 +130,23 @@ func fakeClaude(scenario string, args []string) int {
 				}
 				emit(ctlResponse(id, fakeUsage, ""))
 			}
+		case "assistant":
+			rec.Frames = append(rec.Frames, m)
+			writeRecord(&rec)
 		case "user":
+			rec.Frames = append(rec.Frames, m)
+			if q, ok := m["shouldQuery"].(bool); ok && !q {
+				// History: append without a model turn, as the CLI does.
+				if scenario == "ack_error" {
+					emit(map[string]any{"type": "result", "subtype": "error_during_execution", "is_error": true, "num_turns": 0})
+					continue
+				}
+				emit(map[string]any{"type": "result", "subtype": "success", "is_error": false, "num_turns": 0, "result": ""})
+				writeRecord(&rec)
+				continue
+			}
 			msg, _ := m["message"].(map[string]any)
-			rec.Prompt, _ = msg["content"].(string)
+			rec.Prompt = blockText(msg["content"])
 			if scenario == "tool" {
 				names, code := fakeToolHandshake(read)
 				if code != 0 {
@@ -268,6 +284,22 @@ func playTurn(scenario string) int {
 	}
 	emit(result)
 	return 0
+}
+
+// blockText joins the text blocks of a message's content.
+func blockText(content any) string {
+	if s, ok := content.(string); ok {
+		return s
+	}
+	blocks, _ := content.([]any)
+	var texts []string
+	for _, b := range blocks {
+		bm, _ := b.(map[string]any)
+		if t, ok := bm["text"].(string); ok && bm["type"] == "text" {
+			texts = append(texts, t)
+		}
+	}
+	return strings.Join(texts, "\n")
 }
 
 func waitForKill() int {

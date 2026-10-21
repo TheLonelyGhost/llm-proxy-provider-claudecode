@@ -2,9 +2,9 @@
 // back.
 //
 // Each HTTP request is self-contained: the system and developer messages
-// become the system prompt, and the rest of the conversation is rendered as
-// text into one user turn. Prior tool calls and tool results are rendered
-// the same way, so the plugin keeps no state between requests.
+// become the system prompt, and the rest of the conversation becomes Claude
+// turns (text, tool calls, tool results) that the driver replays before the
+// last one. The plugin keeps no state between requests.
 package chat
 
 import (
@@ -162,7 +162,7 @@ func Translate(req *Request, defaultEffort string) (claudecli.Request, error) {
 		return claudecli.Request{}, invalid("the last message must be from the user or a tool, not %q", last)
 	}
 
-	prompt, err := renderConversation(convo)
+	turns, err := buildTurns(convo)
 	if err != nil {
 		return claudecli.Request{}, err
 	}
@@ -170,7 +170,7 @@ func Translate(req *Request, defaultEffort string) (claudecli.Request, error) {
 		Model:        req.Model,
 		Effort:       effort,
 		SystemPrompt: strings.Join(system, "\n\n"),
-		Prompt:       prompt,
+		Turns:        turns,
 		Tools:        tools,
 	}, nil
 }
@@ -256,57 +256,77 @@ func contentText(raw json.RawMessage) (string, error) {
 	return strings.Join(texts, "\n"), nil
 }
 
-// transcriptPreamble tells Claude how to read a rendered conversation.
-const transcriptPreamble = "The conversation so far is below, oldest first. " +
-	"Tool results are final; do not call a tool again for a result you already have. " +
-	"Reply as the assistant to the latest message.\n\n"
-
-// renderConversation turns the non-system messages into one prompt. A lone
-// user message is passed through unchanged, unless it starts with "/":
-// Claude Code runs such a prompt as a built-in command even with slash
-// commands disabled, so it goes into the transcript form instead.
-func renderConversation(convo []Message) (string, error) {
-	if len(convo) == 1 {
-		text, err := contentText(convo[0].Content)
-		if err != nil {
-			return "", invalid("messages: %v", err)
+// buildTurns converts the conversation to Claude turns. Tool messages and a
+// user message that follows them form one user turn, with the tool results
+// first, as Claude expects after a tool call.
+func buildTurns(convo []Message) ([]claudecli.Turn, error) {
+	known := map[string]struct{}{}
+	turns := make([]claudecli.Turn, 0, len(convo))
+	// userTurn returns the open user turn, starting one if needed.
+	userTurn := func() *claudecli.Turn {
+		if n := len(turns); n > 0 && turns[n-1].Role == claudecli.RoleUser {
+			return &turns[n-1]
 		}
-		if !strings.HasPrefix(strings.TrimSpace(text), "/") {
-			return text, nil
-		}
+		turns = append(turns, claudecli.Turn{Role: claudecli.RoleUser})
+		return &turns[len(turns)-1]
 	}
-	names := map[string]string{}
-	var b strings.Builder
-	b.WriteString(transcriptPreamble)
 	for i, m := range convo {
 		text, err := contentText(m.Content)
 		if err != nil {
-			return "", invalid("messages: %v", err)
+			return nil, invalid("messages: %v", err)
 		}
 		switch m.Role {
 		case "user":
-			fmt.Fprintf(&b, "<user>\n%s\n</user>\n", text)
+			t := userTurn()
+			t.Text = joinText(t.Text, text)
 		case "assistant":
-			b.WriteString("<assistant>\n")
-			if text != "" {
-				b.WriteString(text)
-				b.WriteString("\n")
+			t := claudecli.Turn{Role: claudecli.RoleAssistant, Text: text}
+			for j, tc := range m.ToolCalls {
+				args := json.RawMessage(tc.Function.Arguments)
+				if strings.TrimSpace(tc.Function.Arguments) == "" {
+					args = json.RawMessage(`{}`)
+				}
+				var obj map[string]any
+				if json.Unmarshal(args, &obj) != nil {
+					return nil, invalid("messages[%d].tool_calls[%d]: arguments must be a JSON object", i, j)
+				}
+				if tc.ID == "" || !toolName.MatchString(tc.Function.Name) {
+					return nil, invalid("messages[%d].tool_calls[%d]: needs an id and a valid function name", i, j)
+				}
+				known[tc.ID] = struct{}{}
+				t.ToolCalls = append(t.ToolCalls, claudecli.ToolCall{ID: tc.ID, Name: tc.Function.Name, Input: args})
 			}
-			for _, tc := range m.ToolCalls {
-				names[tc.ID] = tc.Function.Name
-				fmt.Fprintf(&b, "[called tool %s (call id %s) with arguments %s]\n", tc.Function.Name, tc.ID, tc.Function.Arguments)
+			if t.Text != "" || len(t.ToolCalls) > 0 {
+				turns = append(turns, t)
 			}
-			b.WriteString("</assistant>\n")
 		case "tool":
 			if m.ToolCallID == "" {
-				return "", invalid("tool message %d has no tool_call_id", i)
+				return nil, invalid("tool message %d has no tool_call_id", i)
 			}
-			name, ok := names[m.ToolCallID]
-			if !ok {
-				return "", invalid("tool message %d answers unknown tool_call_id %q", i, m.ToolCallID)
+			if _, ok := known[m.ToolCallID]; !ok {
+				return nil, invalid("tool message %d answers unknown tool_call_id %q", i, m.ToolCallID)
 			}
-			fmt.Fprintf(&b, "<tool_result name=%q call_id=%q>\n%s\n</tool_result>\n", name, m.ToolCallID, text)
+			t := userTurn()
+			if t.Text != "" {
+				return nil, invalid("tool message %d must come right after the assistant tool call", i)
+			}
+			t.ToolResults = append(t.ToolResults, claudecli.ToolResult{ToolCallID: m.ToolCallID, Content: text})
 		}
 	}
-	return b.String(), nil
+	for i, t := range turns {
+		if t.Role == claudecli.RoleUser && t.Text == "" && len(t.ToolResults) == 0 {
+			return nil, invalid("turn %d: a user message has no content", i)
+		}
+	}
+	return turns, nil
+}
+
+func joinText(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	}
+	return a + "\n\n" + b
 }

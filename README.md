@@ -103,7 +103,8 @@ The plugin runs each `claude` process with these settings:
 
 - No Claude Code tools.
 - No settings files, hooks, plugins, MCP servers, or `CLAUDE.md` files.
-- No slash commands. A message such as `/usage` goes to the model as text.
+- No slash commands or file mentions. Message text such as `/usage` or
+  `@file` goes to the model as written.
 - No saved sessions.
 - An empty temporary working directory.
 
@@ -179,8 +180,10 @@ them. The plugin does not run them.
 
 - Only `POST /v1/chat/completions` is available. The plugin returns HTTP 501
   for `/v1/completions`, `/v1/embeddings`, and `/v1/responses`.
-- The plugin gives earlier turns to Claude as text in one message. The plugin
-  keeps no conversation data between requests.
+- The plugin keeps no conversation data between requests. Each request must
+  contain the full conversation, as OpenAI chat clients send it. The plugin
+  gives the earlier turns, tool calls, and tool results to Claude as real
+  messages. Claude Code can then use its prompt cache for the earlier turns.
 - Messages can contain only text. Images and other content parts get HTTP 400.
 - The plugin ignores `temperature`, `top_p`, `max_tokens`, `stop`, and other
   sampling parameters. Claude Code has no options for them.

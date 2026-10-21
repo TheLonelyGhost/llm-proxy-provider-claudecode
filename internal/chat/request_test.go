@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -61,9 +62,18 @@ func TestTranslateSingleTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := claudecli.Request{Model: "opus", Effort: "low", SystemPrompt: "Be brief.\n\nUse metric.", Prompt: "line one\nline two"}
-	if got.Model != want.Model || got.Effort != want.Effort || got.SystemPrompt != want.SystemPrompt || got.Prompt != want.Prompt || got.Tools != nil {
-		t.Errorf("Translate = %+v, want %+v", got, want)
+	if got.Model != "opus" || got.Effort != "low" || got.SystemPrompt != "Be brief.\n\nUse metric." || got.Tools != nil {
+		t.Errorf("Translate = %+v", got)
+	}
+	assertTurns(t, got.Turns, `[{"Role":"user","Text":"line one\nline two","ToolCalls":null,"ToolResults":null}]`)
+}
+
+// assertTurns compares turns by their JSON form.
+func assertTurns(t *testing.T, got []claudecli.Turn, want string) {
+	t.Helper()
+	b, _ := json.Marshal(got)
+	if string(b) != want {
+		t.Errorf("turns =\n%s\nwant\n%s", b, want)
 	}
 }
 
@@ -75,26 +85,22 @@ func TestTranslateDefaultEffort(t *testing.T) {
 	}
 }
 
-func TestTranslateRendersHistoryWithToolResults(t *testing.T) {
+func TestTranslateBuildsTurnsWithToolResults(t *testing.T) {
 	req := mustDecode(t, `{"model":"opus","tools":[{"type":"function","function":{"name":"get_time","description":"Get the time","parameters":{"type":"object","properties":{"tz":{"type":"string"}}}}}],
 	"messages":[
 		{"role":"user","content":"What time is it?"},
-		{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_time","arguments":"{\"tz\":\"UTC\"}"}}]},
-		{"role":"tool","tool_call_id":"call_1","content":"12:00"}]}`)
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_time","arguments":"{\"tz\":\"UTC\"}"}},{"id":"call_2","type":"function","function":{"name":"get_time","arguments":""}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"12:00"},
+		{"role":"tool","tool_call_id":"call_2","content":"12:00"},
+		{"role":"user","content":"Thanks. And in words?"}]}`)
 	got, err := Translate(req, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{
-		transcriptPreamble,
-		"<user>\nWhat time is it?\n</user>",
-		`[called tool get_time (call id call_1) with arguments {"tz":"UTC"}]`,
-		"<tool_result name=\"get_time\" call_id=\"call_1\">\n12:00\n</tool_result>",
-	} {
-		if !strings.Contains(got.Prompt, want) {
-			t.Errorf("prompt missing %q:\n%s", want, got.Prompt)
-		}
-	}
+	assertTurns(t, got.Turns, `[`+
+		`{"Role":"user","Text":"What time is it?","ToolCalls":null,"ToolResults":null},`+
+		`{"Role":"assistant","Text":"","ToolCalls":[{"ID":"call_1","Name":"get_time","Input":{"tz":"UTC"}},{"ID":"call_2","Name":"get_time","Input":{}}],"ToolResults":null},`+
+		`{"Role":"user","Text":"Thanks. And in words?","ToolCalls":null,"ToolResults":[{"ToolCallID":"call_1","Content":"12:00"},{"ToolCallID":"call_2","Content":"12:00"}]}]`)
 	if len(got.Tools) != 1 || got.Tools[0].Name != "get_time" || got.Tools[0].Description != "Get the time" {
 		t.Fatalf("tools = %+v", got.Tools)
 	}
@@ -141,6 +147,10 @@ func TestTranslateRejects(t *testing.T) {
 		{name: "bad history content", body: `{"model":"m","messages":[{"role":"assistant","content":42},` + user + `]}`, want: "string or an array"},
 		{name: "tool without id", body: `{"model":"m","messages":[` + user + `,{"role":"tool","content":"x"}]}`, want: "no tool_call_id"},
 		{name: "tool unknown id", body: `{"model":"m","messages":[` + user + `,{"role":"tool","tool_call_id":"nope","content":"x"}]}`, want: "unknown tool_call_id"},
+		{name: "bad tool args", body: `{"model":"m","messages":[` + user + `,{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"[1]"}}]},{"role":"tool","tool_call_id":"c1","content":"x"}]}`, want: "arguments must be a JSON object"},
+		{name: "tool call without id", body: `{"model":"m","messages":[` + user + `,{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"f","arguments":"{}"}}]},` + user + `]}`, want: "needs an id"},
+		{name: "tool result after user text", body: `{"model":"m","messages":[` + user + `,{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},` + user + `,{"role":"tool","tool_call_id":"c1","content":"x"}]}`, want: "right after the assistant tool call"},
+		{name: "empty user", body: `{"model":"m","messages":[{"role":"user","content":""}]}`, want: "has no content"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -153,28 +163,25 @@ func TestTranslateRejects(t *testing.T) {
 	}
 }
 
-func TestTranslateSlashPromptIsNeverACommand(t *testing.T) {
-	for _, content := range []string{"/usage", "  /logout"} {
-		req := mustDecode(t, `{"model":"m","messages":[{"role":"user","content":"`+content+`"}]}`)
-		got, err := Translate(req, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.HasPrefix(got.Prompt, transcriptPreamble) || !strings.Contains(got.Prompt, "<user>\n"+content+"\n</user>") {
-			t.Errorf("prompt for %q = %q, want the transcript form", content, got.Prompt)
-		}
-	}
-}
-
-func TestTranslateAssistantTextInHistory(t *testing.T) {
-	req := mustDecode(t, `{"model":"m","messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"}]}`)
+func TestTranslateKeepsSlashTextVerbatim(t *testing.T) {
+	req := mustDecode(t, `{"model":"m","messages":[{"role":"user","content":"/usage"}]}`)
 	got, err := Translate(req, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(got.Prompt, "<assistant>\nb\n</assistant>\n<user>\nc\n</user>") {
-		t.Errorf("prompt = %q", got.Prompt)
+	assertTurns(t, got.Turns, `[{"Role":"user","Text":"/usage","ToolCalls":null,"ToolResults":null}]`)
+}
+
+func TestTranslateHistoryTurns(t *testing.T) {
+	req := mustDecode(t, `{"model":"m","messages":[{"role":"user","content":"a"},{"role":"user","content":"a2"},{"role":"assistant","content":"b"},{"role":"assistant","content":""},{"role":"user","content":"c"}]}`)
+	got, err := Translate(req, "")
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertTurns(t, got.Turns, `[`+
+		`{"Role":"user","Text":"a\n\na2","ToolCalls":null,"ToolResults":null},`+
+		`{"Role":"assistant","Text":"b","ToolCalls":null,"ToolResults":null},`+
+		`{"Role":"user","Text":"c","ToolCalls":null,"ToolResults":null}]`)
 }
 
 // FuzzChatRequest checks that decoding and translating never panic and

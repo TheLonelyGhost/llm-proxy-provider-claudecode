@@ -75,6 +75,12 @@ task sideload       # install bin + manifest into llm-proxy's plugin cache
   `--permission-prompts none`, empty work dir). Never add
   `--permission-mode bypassPermissions`, `--dangerously-skip-permissions`, or
   `--bare` (it disables subscription OAuth).
+- Conversation history goes to the CLI as native stream-json frames
+  (`claudecli.session.replay`): user frames with `shouldQuery:false` and
+  `client_composed:true`, each acknowledged before the next frame, and
+  assistant frames. Every user frame sets `client_composed:true`, so `@file`
+  and `/command` text is never expanded. Do not render history into prompt
+  text.
 - Client tools are never executed by the plugin. The bridge never answers
   `tools/call`; the run stops at `tool_use`.
 - No message may reach the model before the login check and the model check

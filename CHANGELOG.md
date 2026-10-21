@@ -17,6 +17,8 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `reasoning_effort` on chat requests and the `effort` attribute (`CLAUDECODE_EFFORT`) set the Claude Code reasoning effort.
 - `budget` tool that shows usage credits or plan limit usage for `GET /v1/usage/budget`.
 - OpenAI tool calling: Claude can call client `tools`, and the plugin returns `tool_calls` for the client to run.
+- Multi-turn conversations: earlier messages, tool calls, and tool results go to Claude as real conversation turns, so Claude Code can reuse its prompt cache for them.
+- Message text goes to the model as written: `/commands` and `@file` mentions in a message have no effect.
 - `cli_path` (`CLAUDECODE_CLI_PATH`) and `max_concurrency` (`CLAUDECODE_MAX_CONCURRENCY`) attributes.
 
 [Unreleased]: https://github.com/thelonelyghost/llm-proxy-provider-claudecode/commits/main

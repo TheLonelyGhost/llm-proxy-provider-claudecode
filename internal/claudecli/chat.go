@@ -29,7 +29,40 @@ type Tool struct {
 	InputSchema json.RawMessage
 }
 
-// Request is one chat turn.
+// Turn roles.
+const (
+	RoleUser      = "user"
+	RoleAssistant = "assistant"
+)
+
+// Turn is one message of the conversation.
+type Turn struct {
+	// Role is RoleUser or RoleAssistant.
+	Role string
+	Text string
+	// ToolCalls are the assistant's calls to client tools.
+	ToolCalls []ToolCall
+	// ToolResults answer the previous assistant turn's tool calls; only on
+	// user turns.
+	ToolResults []ToolResult
+}
+
+// ToolCall is a client tool call the assistant made earlier.
+type ToolCall struct {
+	ID   string
+	Name string
+	// Input is the JSON object of arguments.
+	Input json.RawMessage
+}
+
+// ToolResult is the client's result for a tool call.
+type ToolResult struct {
+	ToolCallID string
+	Content    string
+}
+
+// Request is one chat completion: the conversation so far and the turn to
+// answer.
 type Request struct {
 	// Model is a value for --model.
 	Model string
@@ -37,8 +70,9 @@ type Request struct {
 	Effort string
 	// SystemPrompt replaces Claude Code's system prompt. Empty is allowed.
 	SystemPrompt string
-	// Prompt is the user message text.
-	Prompt string
+	// Turns is the conversation, oldest first. The last turn must be a user
+	// turn: Claude answers it. Earlier turns are replayed as history.
+	Turns []Turn
 	// Tools are client functions exposed through the tool bridge.
 	Tools []Tool
 }
@@ -123,6 +157,9 @@ func chatArgs(req Request, systemPromptFile string) []string {
 // holds the calls and Result.StopReason is "tool_use". An error from emit
 // stops the run and is returned.
 func (d *Driver) Chat(ctx context.Context, req Request, emit func(Event) error) (Result, error) {
+	if n := len(req.Turns); n == 0 || req.Turns[n-1].Role != RoleUser {
+		return Result{}, fmt.Errorf("chat request must end with a user turn")
+	}
 	// The system prompt goes through a file: argv has per-argument size
 	// limits and a prompt must never be parsed as a flag.
 	spFile, err := os.CreateTemp(d.WorkDir, "system-prompt-*.txt")
@@ -148,13 +185,7 @@ func (d *Driver) Chat(ctx context.Context, req Request, emit func(Event) error) 
 	if _, err := s.initializeWith(bridge); err != nil {
 		return Result{}, err
 	}
-	user := map[string]any{
-		"type":               "user",
-		"message":            map[string]any{"role": "user", "content": req.Prompt},
-		"parent_tool_use_id": nil,
-		"session_id":         "",
-	}
-	if err := s.send(user); err != nil {
+	if err := s.replay(req.Turns, bridge); err != nil {
 		return Result{}, err
 	}
 	// Without tools nothing else is written, so end input now. With tools,
@@ -193,6 +224,92 @@ func (d *Driver) Chat(ctx context.Context, req Request, emit func(Event) error) 
 			return t.finish(f)
 		}
 	}
+}
+
+// replay writes the conversation to the CLI as native messages. Every turn
+// but the last is history: user turns are sent with shouldQuery false and
+// acknowledged before the next frame (assistant frames are applied as they
+// are read, user frames are queued), assistant turns as replay frames. The
+// last user turn starts the reply. client_composed keeps Claude Code from
+// expanding @file mentions or running /commands in message text.
+func (s *session) replay(turns []Turn, h controlHandler) error {
+	last := len(turns) - 1
+	for i, t := range turns {
+		if t.Role == RoleAssistant {
+			msg := map[string]any{
+				"id":      fmt.Sprintf("msg_replay_%d", i),
+				"type":    "message",
+				"role":    "assistant",
+				"content": assistantBlocks(t),
+			}
+			if err := s.send(map[string]any{"type": "assistant", "message": msg, "parent_tool_use_id": nil, "session_id": ""}); err != nil {
+				return err
+			}
+			continue
+		}
+		frame := map[string]any{
+			"type":               "user",
+			"message":            map[string]any{"role": "user", "content": userBlocks(t)},
+			"parent_tool_use_id": nil,
+			"session_id":         "",
+			"client_composed":    true,
+		}
+		if i == last {
+			return s.send(frame)
+		}
+		frame["shouldQuery"] = false
+		if err := s.send(frame); err != nil {
+			return err
+		}
+		if err := s.awaitAck(h); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// awaitAck reads frames until the CLI acknowledges a history frame with a
+// result that ran no model turn.
+func (s *session) awaitAck(h controlHandler) error {
+	for {
+		f, err := s.next()
+		if err != nil {
+			return err
+		}
+		switch f.Type {
+		case "control_request":
+			if err := s.answer(f, h); err != nil {
+				return err
+			}
+		case "result":
+			if f.IsError {
+				return &UpstreamError{Message: "replaying conversation history failed: " + f.Subtype}
+			}
+			return nil
+		}
+	}
+}
+
+func assistantBlocks(t Turn) []map[string]any {
+	blocks := make([]map[string]any, 0, 1+len(t.ToolCalls))
+	if t.Text != "" {
+		blocks = append(blocks, map[string]any{"type": "text", "text": t.Text})
+	}
+	for _, tc := range t.ToolCalls {
+		blocks = append(blocks, map[string]any{"type": "tool_use", "id": tc.ID, "name": bridgePrefix + tc.Name, "input": tc.Input})
+	}
+	return blocks
+}
+
+func userBlocks(t Turn) []map[string]any {
+	blocks := make([]map[string]any, 0, 1+len(t.ToolResults))
+	for _, r := range t.ToolResults {
+		blocks = append(blocks, map[string]any{"type": "tool_result", "tool_use_id": r.ToolCallID, "content": r.Content})
+	}
+	if t.Text != "" {
+		blocks = append(blocks, map[string]any{"type": "text", "text": t.Text})
+	}
+	return blocks
 }
 
 // turn tracks one assistant turn while its stream events arrive.
