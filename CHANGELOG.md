@@ -19,6 +19,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - OpenAI tool calling: Claude can call client `tools`, and the plugin returns `tool_calls` for the client to run.
 - Multi-turn conversations: earlier messages, tool calls, and tool results go to Claude as real conversation turns, so Claude Code can reuse its prompt cache for them.
 - Message text goes to the model as written: `/commands` and `@file` mentions in a message have no effect.
+- User and tool messages can contain images (`image_url` with a base64 data URL or an `https` URL) and PDF files (`file` with `file_data`); Claude gets them as images and documents. Audio, `file_id`, and other file types get HTTP 400.
 - `cli_path` (`CLAUDECODE_CLI_PATH`) and `max_concurrency` (`CLAUDECODE_MAX_CONCURRENCY`) attributes.
 
 [Unreleased]: https://github.com/thelonelyghost/llm-proxy-provider-claudecode/commits/main

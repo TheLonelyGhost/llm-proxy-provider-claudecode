@@ -45,9 +45,14 @@ func readRecord(t *testing.T, path string) record {
 	return r
 }
 
+// textBlocks is content that is only text.
+func textBlocks(text string) []Block {
+	return []Block{{Kind: BlockText, Text: text}}
+}
+
 // ask is a conversation of one user message.
 func ask(text string) []Turn {
-	return []Turn{{Role: RoleUser, Text: text}}
+	return []Turn{{Role: RoleUser, Content: textBlocks(text)}}
 }
 
 func collect(events *[]Event) func(Event) error {
@@ -145,9 +150,9 @@ func containsSeq(args, seq []string) bool {
 func TestChatReplaysHistory(t *testing.T) {
 	d, recPath := fakeDriver(t, "text")
 	turns := []Turn{
-		{Role: RoleUser, Text: "My name is Ada."},
-		{Role: RoleAssistant, Text: "Checking.", ToolCalls: []ToolCall{{ID: "call_1", Name: "get_time", Input: json.RawMessage(`{"tz":"UTC"}`)}}},
-		{Role: RoleUser, ToolResults: []ToolResult{{ToolCallID: "call_1", Content: "12:00"}}, Text: "And my name?"},
+		{Role: RoleUser, Content: textBlocks("My name is Ada.")},
+		{Role: RoleAssistant, Content: textBlocks("Checking."), ToolCalls: []ToolCall{{ID: "call_1", Name: "get_time", Input: json.RawMessage(`{"tz":"UTC"}`)}}},
+		{Role: RoleUser, ToolResults: []ToolResult{{ToolCallID: "call_1", Content: textBlocks("12:00")}}, Content: textBlocks("And my name?")},
 	}
 	if _, err := d.Chat(context.Background(), Request{Model: "haiku", Turns: turns}, func(Event) error { return nil }); err != nil {
 		t.Fatal(err)
@@ -167,9 +172,38 @@ func TestChatReplaysHistory(t *testing.T) {
 	}
 }
 
+func TestChatSendsImagesAndDocuments(t *testing.T) {
+	d, recPath := fakeDriver(t, "text")
+	png := Block{Kind: BlockImage, MediaType: "image/png", Data: "iVBORw0K"}
+	turns := []Turn{
+		{Role: RoleUser, Content: []Block{{Kind: BlockText, Text: "Compare"}, png, {Kind: BlockImage, URL: "https://example.invalid/a.png"}}},
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "call_1", Name: "screenshot", Input: json.RawMessage(`{}`)}}},
+		{Role: RoleUser, ToolResults: []ToolResult{{ToolCallID: "call_1", Content: []Block{{Kind: BlockText, Text: "shot"}, png}}},
+			Content: []Block{{Kind: BlockDocument, MediaType: "application/pdf", Data: "JVBERi0x"}}},
+	}
+	if _, err := d.Chat(context.Background(), Request{Model: "haiku", Turns: turns}, func(Event) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := json.Marshal(readRecord(t, recPath).Frames)
+	want := `[` +
+		`{"client_composed":true,"message":{"content":[{"text":"Compare","type":"text"},{"source":{"data":"iVBORw0K","media_type":"image/png","type":"base64"},"type":"image"},{"source":{"type":"url","url":"https://example.invalid/a.png"},"type":"image"}],"role":"user"},"parent_tool_use_id":null,"session_id":"","shouldQuery":false,"type":"user"},` +
+		`{"message":{"content":[{"id":"call_1","input":{},"name":"mcp__c__screenshot","type":"tool_use"}],"id":"msg_replay_1","role":"assistant","type":"message"},"parent_tool_use_id":null,"session_id":"","type":"assistant"},` +
+		`{"client_composed":true,"message":{"content":[{"content":[{"text":"shot","type":"text"},{"source":{"data":"iVBORw0K","media_type":"image/png","type":"base64"},"type":"image"}],"tool_use_id":"call_1","type":"tool_result"},{"source":{"data":"JVBERi0x","media_type":"application/pdf","type":"base64"},"type":"document"}],"role":"user"},"parent_tool_use_id":null,"session_id":"","type":"user"}` +
+		`]`
+	if string(got) != want {
+		t.Errorf("frames =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestBlockRejectsUnknownKind(t *testing.T) {
+	if _, err := json.Marshal(Block{Kind: "audio"}); err == nil || !strings.Contains(err.Error(), `unknown content block kind "audio"`) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestChatHistoryAckError(t *testing.T) {
 	d, _ := fakeDriver(t, "ack_error")
-	turns := []Turn{{Role: RoleUser, Text: "a"}, {Role: RoleAssistant, Text: "b"}, {Role: RoleUser, Text: "c"}}
+	turns := []Turn{{Role: RoleUser, Content: textBlocks("a")}, {Role: RoleAssistant, Content: textBlocks("b")}, {Role: RoleUser, Content: textBlocks("c")}}
 	_, err := d.Chat(context.Background(), Request{Model: "haiku", Turns: turns}, func(Event) error { return nil })
 	var ue *UpstreamError
 	if !errors.As(err, &ue) || !strings.Contains(ue.Message, "replaying conversation history failed") {
@@ -179,7 +213,7 @@ func TestChatHistoryAckError(t *testing.T) {
 
 func TestChatNeedsFinalUserTurn(t *testing.T) {
 	d := &Driver{Path: os.Args[0], WorkDir: t.TempDir()}
-	for _, turns := range [][]Turn{nil, {{Role: RoleUser, Text: "a"}, {Role: RoleAssistant, Text: "b"}}} {
+	for _, turns := range [][]Turn{nil, {{Role: RoleUser, Content: textBlocks("a")}, {Role: RoleAssistant, Content: textBlocks("b")}}} {
 		if _, err := d.Chat(context.Background(), Request{Turns: turns}, func(Event) error { return nil }); err == nil {
 			t.Errorf("turns %+v: want an error", turns)
 		}
