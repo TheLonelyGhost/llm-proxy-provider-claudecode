@@ -39,12 +39,51 @@ const (
 type Turn struct {
 	// Role is RoleUser or RoleAssistant.
 	Role string
-	Text string
+	// Content is the message in order. Assistant turns hold only text.
+	Content []Block
 	// ToolCalls are the assistant's calls to client tools.
 	ToolCalls []ToolCall
 	// ToolResults answer the previous assistant turn's tool calls; only on
 	// user turns.
 	ToolResults []ToolResult
+}
+
+// BlockKind is the Anthropic content block type of a Block.
+type BlockKind string
+
+// Block kinds.
+const (
+	BlockText     BlockKind = "text"
+	BlockImage    BlockKind = "image"
+	BlockDocument BlockKind = "document"
+)
+
+// Block is one piece of message or tool result content.
+type Block struct {
+	Kind BlockKind
+	// Text is the text of a text block.
+	Text string
+	// MediaType and Data are the type and base64 data of an image or
+	// document.
+	MediaType string
+	Data      string
+	// URL is an image that the API fetches, in place of Data.
+	URL string
+}
+
+// MarshalJSON encodes b as an Anthropic content block.
+func (b Block) MarshalJSON() ([]byte, error) {
+	switch b.Kind {
+	case BlockText:
+		return json.Marshal(map[string]any{"type": "text", "text": b.Text})
+	case BlockImage, BlockDocument:
+		source := map[string]any{"type": "base64", "media_type": b.MediaType, "data": b.Data}
+		if b.URL != "" {
+			source = map[string]any{"type": "url", "url": b.URL}
+		}
+		return json.Marshal(map[string]any{"type": string(b.Kind), "source": source})
+	}
+	return nil, fmt.Errorf("unknown content block kind %q", b.Kind)
 }
 
 // ToolCall is a client tool call the assistant made earlier.
@@ -58,7 +97,7 @@ type ToolCall struct {
 // ToolResult is the client's result for a tool call.
 type ToolResult struct {
 	ToolCallID string
-	Content    string
+	Content    []Block
 }
 
 // Request is one chat completion: the conversation so far and the turn to
@@ -290,10 +329,10 @@ func (s *session) awaitAck(h controlHandler) error {
 	}
 }
 
-func assistantBlocks(t Turn) []map[string]any {
-	blocks := make([]map[string]any, 0, 1+len(t.ToolCalls))
-	if t.Text != "" {
-		blocks = append(blocks, map[string]any{"type": "text", "text": t.Text})
+func assistantBlocks(t Turn) []any {
+	blocks := make([]any, 0, len(t.Content)+len(t.ToolCalls))
+	for _, b := range t.Content {
+		blocks = append(blocks, b)
 	}
 	for _, tc := range t.ToolCalls {
 		blocks = append(blocks, map[string]any{"type": "tool_use", "id": tc.ID, "name": bridgePrefix + tc.Name, "input": tc.Input})
@@ -301,15 +340,27 @@ func assistantBlocks(t Turn) []map[string]any {
 	return blocks
 }
 
-func userBlocks(t Turn) []map[string]any {
-	blocks := make([]map[string]any, 0, 1+len(t.ToolResults))
+func userBlocks(t Turn) []any {
+	blocks := make([]any, 0, len(t.ToolResults)+len(t.Content))
 	for _, r := range t.ToolResults {
-		blocks = append(blocks, map[string]any{"type": "tool_result", "tool_use_id": r.ToolCallID, "content": r.Content})
+		blocks = append(blocks, map[string]any{"type": "tool_result", "tool_use_id": r.ToolCallID, "content": resultContent(r.Content)})
 	}
-	if t.Text != "" {
-		blocks = append(blocks, map[string]any{"type": "text", "text": t.Text})
+	for _, b := range t.Content {
+		blocks = append(blocks, b)
 	}
 	return blocks
+}
+
+// resultContent is a tool result's content: a string when it is only text,
+// or content blocks.
+func resultContent(c []Block) any {
+	switch {
+	case len(c) == 0:
+		return ""
+	case len(c) == 1 && c[0].Kind == BlockText:
+		return c[0].Text
+	}
+	return c
 }
 
 // turn tracks one assistant turn while its stream events arrive.

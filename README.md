@@ -176,6 +176,26 @@ them. The plugin does not run them.
 
 `tool_choice` can be `auto` or `none`. Other values get HTTP 400.
 
+## Images and files
+
+User messages and `tool` messages can contain images and PDF files. Claude
+gets them as images and documents, as when you attach a file in Claude Code.
+
+| Content part | Accepted values |
+|---|---|
+| `image_url` | A base64 data URL (`data:image/png;base64,...`) or an `https` URL. The image types are PNG, JPEG, GIF, and WebP. The plugin ignores `detail`. |
+| `file` | `file_data` with a base64 data URL of a PDF (`data:application/pdf;base64,...`). |
+
+- For an `https` URL, Anthropic gets the image from the URL. The plugin does
+  not get it.
+- `file_id`, other file types, and `input_audio` get HTTP 400.
+- A data URL that is not valid base64 gets HTTP 400.
+- System, developer, and assistant messages can contain only text.
+- llm-proxy 1.1 accepts request bodies of 8 MiB or less. Base64 makes a file
+  approximately 33% larger. Each request contains the full conversation, thus
+  all earlier images and files.
+- Images and files use your plan usage, as in Claude Code.
+
 ## Limitations
 
 - Only `POST /v1/chat/completions` is available. The plugin returns HTTP 501
@@ -184,7 +204,8 @@ them. The plugin does not run them.
   contain the full conversation, as OpenAI chat clients send it. The plugin
   gives the earlier turns, tool calls, and tool results to Claude as real
   messages. Claude Code can then use its prompt cache for the earlier turns.
-- Messages can contain only text. Images and other content parts get HTTP 400.
+- Messages can contain only text, images, and PDF files. Refer to
+  [Images and files](#images-and-files).
 - The plugin ignores `temperature`, `top_p`, `max_tokens`, `stop`, and other
   sampling parameters. Claude Code has no options for them.
 - `n` must be 1. `response_format` must be `text`. The plugin does not

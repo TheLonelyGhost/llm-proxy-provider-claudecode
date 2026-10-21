@@ -65,7 +65,7 @@ func TestTranslateSingleTurn(t *testing.T) {
 	if got.Model != "opus" || got.Effort != "low" || got.SystemPrompt != "Be brief.\n\nUse metric." || got.Tools != nil {
 		t.Errorf("Translate = %+v", got)
 	}
-	assertTurns(t, got.Turns, `[{"Role":"user","Text":"line one\nline two","ToolCalls":null,"ToolResults":null}]`)
+	assertTurns(t, got.Turns, `[{"Role":"user","Content":[{"text":"line one\nline two","type":"text"}],"ToolCalls":null,"ToolResults":null}]`)
 }
 
 // assertTurns compares turns by their JSON form.
@@ -98,9 +98,9 @@ func TestTranslateBuildsTurnsWithToolResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertTurns(t, got.Turns, `[`+
-		`{"Role":"user","Text":"What time is it?","ToolCalls":null,"ToolResults":null},`+
-		`{"Role":"assistant","Text":"","ToolCalls":[{"ID":"call_1","Name":"get_time","Input":{"tz":"UTC"}},{"ID":"call_2","Name":"get_time","Input":{}}],"ToolResults":null},`+
-		`{"Role":"user","Text":"Thanks. And in words?","ToolCalls":null,"ToolResults":[{"ToolCallID":"call_1","Content":"12:00"},{"ToolCallID":"call_2","Content":"12:00"}]}]`)
+		`{"Role":"user","Content":[{"text":"What time is it?","type":"text"}],"ToolCalls":null,"ToolResults":null},`+
+		`{"Role":"assistant","Content":null,"ToolCalls":[{"ID":"call_1","Name":"get_time","Input":{"tz":"UTC"}},{"ID":"call_2","Name":"get_time","Input":{}}],"ToolResults":null},`+
+		`{"Role":"user","Content":[{"text":"Thanks. And in words?","type":"text"}],"ToolCalls":null,"ToolResults":[{"ToolCallID":"call_1","Content":[{"text":"12:00","type":"text"}]},{"ToolCallID":"call_2","Content":[{"text":"12:00","type":"text"}]}]}]`)
 	if len(got.Tools) != 1 || got.Tools[0].Name != "get_time" || got.Tools[0].Description != "Get the time" {
 		t.Fatalf("tools = %+v", got.Tools)
 	}
@@ -141,7 +141,6 @@ func TestTranslateRejects(t *testing.T) {
 		{name: "role", body: `{"model":"m","messages":[{"role":"function","content":"x"}]}`, want: `unsupported role "function"`},
 		{name: "only system", body: `{"model":"m","messages":[{"role":"system","content":"x"}]}`, want: "must include a user message"},
 		{name: "ends with assistant", body: `{"model":"m","messages":[` + user + `,{"role":"assistant","content":"x"}]}`, want: "last message"},
-		{name: "image", body: `{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}]}`, want: "only text"},
 		{name: "bad content", body: `{"model":"m","messages":[{"role":"user","content":42}]}`, want: "string or an array"},
 		{name: "bad system content", body: `{"model":"m","messages":[{"role":"system","content":42},` + user + `]}`, want: "string or an array"},
 		{name: "bad history content", body: `{"model":"m","messages":[{"role":"assistant","content":42},` + user + `]}`, want: "string or an array"},
@@ -169,7 +168,7 @@ func TestTranslateKeepsSlashTextVerbatim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertTurns(t, got.Turns, `[{"Role":"user","Text":"/usage","ToolCalls":null,"ToolResults":null}]`)
+	assertTurns(t, got.Turns, `[{"Role":"user","Content":[{"text":"/usage","type":"text"}],"ToolCalls":null,"ToolResults":null}]`)
 }
 
 func TestTranslateHistoryTurns(t *testing.T) {
@@ -179,9 +178,66 @@ func TestTranslateHistoryTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertTurns(t, got.Turns, `[`+
-		`{"Role":"user","Text":"a\n\na2","ToolCalls":null,"ToolResults":null},`+
-		`{"Role":"assistant","Text":"b","ToolCalls":null,"ToolResults":null},`+
-		`{"Role":"user","Text":"c","ToolCalls":null,"ToolResults":null}]`)
+		`{"Role":"user","Content":[{"text":"a\n\na2","type":"text"}],"ToolCalls":null,"ToolResults":null},`+
+		`{"Role":"assistant","Content":[{"text":"b","type":"text"}],"ToolCalls":null,"ToolResults":null},`+
+		`{"Role":"user","Content":[{"text":"c","type":"text"}],"ToolCalls":null,"ToolResults":null}]`)
+}
+
+func TestTranslateImagesAndFiles(t *testing.T) {
+	req := mustDecode(t, `{"model":"m","messages":[
+		{"role":"user","content":"Look:"},
+		{"role":"user","content":[
+			{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo=","detail":"high"}},
+			{"type":"text","text":"and"},{"type":"text","text":"this"},
+			{"type":"image_url","image_url":{"url":"https://example.invalid/a.png"}}]},
+		{"role":"user","content":[{"type":"file","file":{"filename":"a.pdf","file_data":"data:application/pdf;base64,JVBERi0xLjQ="}}]},
+		{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shot","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:IMAGE/JPEG;base64,/9j/"}}]}]}`)
+	got, err := Translate(req, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTurns(t, got.Turns, `[`+
+		`{"Role":"user","Content":[{"text":"Look:","type":"text"},`+
+		`{"source":{"data":"iVBORw0KGgo=","media_type":"image/png","type":"base64"},"type":"image"},`+
+		`{"text":"and\nthis","type":"text"},`+
+		`{"source":{"type":"url","url":"https://example.invalid/a.png"},"type":"image"},`+
+		`{"source":{"data":"JVBERi0xLjQ=","media_type":"application/pdf","type":"base64"},"type":"document"}],"ToolCalls":null,"ToolResults":null},`+
+		`{"Role":"assistant","Content":null,"ToolCalls":[{"ID":"call_1","Name":"shot","Input":{}}],"ToolResults":null},`+
+		`{"Role":"user","Content":null,"ToolCalls":null,"ToolResults":[{"ToolCallID":"call_1","Content":[{"text":"shot","type":"text"},`+
+		`{"source":{"data":"/9j/","media_type":"image/jpeg","type":"base64"},"type":"image"}]}]}]`)
+}
+
+func TestTranslateRejectsMedia(t *testing.T) {
+	user := `{"role":"user","content":"hi"}`
+	part := func(p string) string { return `{"model":"m","messages":[{"role":"user","content":[` + p + `]}]}` }
+	image := func(url string) string { return part(`{"type":"image_url","image_url":{"url":"` + url + `"}}`) }
+	tests := []struct {
+		name, body, want string
+	}{
+		{name: "image in system", body: `{"model":"m","messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/a.png"}}]},` + user + `]}`, want: `"image_url" is not supported here; only text`},
+		{name: "image in assistant", body: `{"model":"m","messages":[` + user + `,{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/a.png"}}]},` + user + `]}`, want: `"image_url" is not supported here; only text`},
+		{name: "no image_url", body: part(`{"type":"image_url"}`), want: "has no image_url"},
+		{name: "http url", body: image("http://example.invalid/a.png"), want: "not a data URL"},
+		{name: "not base64", body: image("data:image/png,abc"), want: "must be base64 encoded"},
+		{name: "no data", body: image("data:image/png;base64,"), want: "must be base64 encoded"},
+		{name: "image type", body: image("data:image/bmp;base64,AAAA"), want: `media type "image/bmp" is not supported (accepted: image/gif, image/jpeg, image/png, image/webp)`},
+		{name: "bad base64", body: image("data:image/png;base64,!!!!"), want: "invalid base64"},
+		{name: "no file", body: part(`{"type":"file"}`), want: "has no file"},
+		{name: "file_id", body: part(`{"type":"file","file":{"file_id":"file-1"}}`), want: "file_id is not supported"},
+		{name: "file type", body: part(`{"type":"file","file":{"file_data":"data:text/plain;base64,aGk="}}`), want: `media type "text/plain" is not supported (accepted: application/pdf)`},
+		{name: "audio", body: part(`{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}`), want: "audio input is not supported"},
+		{name: "unknown part", body: part(`{"type":"video"}`), want: `content part type "video" is not supported`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Translate(mustDecode(t, tt.body), "")
+			var ce *Error
+			if !errors.As(err, &ce) || ce.Status != 400 || !strings.Contains(ce.Msg, tt.want) {
+				t.Fatalf("err = %v, want 400 containing %q", err, tt.want)
+			}
+		})
+	}
 }
 
 // FuzzChatRequest checks that decoding and translating never panic and
@@ -191,6 +247,7 @@ func FuzzChatRequest(f *testing.F) {
 	f.Add(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"}]},{"role":"assistant","tool_calls":[{"id":"1","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"1","content":"r"}]}`)
 	f.Add(`{"model":"m","tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":"auto","messages":[{"role":"user","content":"x"}]}`)
 	f.Add(`{"model":"m","reasoning_effort":"max","messages":[{"role":"system","content":"s"},{"role":"user","content":"x"}]}`)
+	f.Add(`{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"file","file":{"file_data":"data:application/pdf;base64,AAAA"}}]}]}`)
 	f.Add(`[]`)
 	f.Fuzz(func(t *testing.T, body string) {
 		req, err := Decode([]byte(body))

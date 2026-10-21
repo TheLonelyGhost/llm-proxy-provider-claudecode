@@ -3,15 +3,19 @@
 //
 // Each HTTP request is self-contained: the system and developer messages
 // become the system prompt, and the rest of the conversation becomes Claude
-// turns (text, tool calls, tool results) that the driver replays before the
-// last one. The plugin keeps no state between requests.
+// turns (text, images, documents, tool calls, tool results) that the driver
+// replays before the last one. The plugin keeps no state between requests.
 package chat
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/thelonelyghost/llm-proxy-provider-claudecode/internal/claudecli"
@@ -229,31 +233,136 @@ func translateTools(in []Tool) ([]claudecli.Tool, error) {
 	return out, nil
 }
 
+// contentPart is one OpenAI content part.
+type contentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	ImageURL *struct {
+		URL string `json:"url"`
+	} `json:"image_url"`
+	File *struct {
+		FileData string `json:"file_data"`
+	} `json:"file"`
+}
+
+// Media types Claude accepts in image and document blocks.
+var (
+	imageTypes    = map[string]bool{"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true}
+	documentTypes = map[string]bool{"application/pdf": true}
+)
+
 // contentText returns the text of a message's content: a string, or an
 // array of text parts. Other part types are rejected.
 func contentText(raw json.RawMessage) (string, error) {
+	blocks, err := contentBlocks(raw, false)
+	if err != nil || len(blocks) == 0 {
+		return "", err
+	}
+	return blocks[0].Text, nil
+}
+
+// contentBlocks converts a message's content, a string or an array of
+// content parts, to Claude blocks. Adjacent text parts become one text
+// block. Image and file parts are accepted only when media is true.
+func contentBlocks(raw json.RawMessage, media bool) ([]claudecli.Block, error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return "", nil
+		return nil, nil
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
-	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(raw, &parts); err != nil {
-		return "", fmt.Errorf("content must be a string or an array of content parts")
-	}
-	texts := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p.Type != "text" {
-			return "", fmt.Errorf("content part type %q is not supported; only text", p.Type)
+		if s == "" {
+			return nil, nil
 		}
-		texts = append(texts, p.Text)
+		return []claudecli.Block{{Kind: claudecli.BlockText, Text: s}}, nil
 	}
-	return strings.Join(texts, "\n"), nil
+	var parts []contentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil, fmt.Errorf("content must be a string or an array of content parts")
+	}
+	var blocks []claudecli.Block
+	var texts []string
+	flush := func() {
+		if text := strings.Join(texts, "\n"); text != "" {
+			blocks = append(blocks, claudecli.Block{Kind: claudecli.BlockText, Text: text})
+		}
+		texts = nil
+	}
+	for _, p := range parts {
+		if p.Type == "text" {
+			texts = append(texts, p.Text)
+			continue
+		}
+		if !media {
+			return nil, fmt.Errorf("content part type %q is not supported here; only text", p.Type)
+		}
+		b, err := mediaBlock(p)
+		if err != nil {
+			return nil, err
+		}
+		flush()
+		blocks = append(blocks, b)
+	}
+	flush()
+	return blocks, nil
+}
+
+// mediaBlock converts an image_url or file part to an image or document
+// block.
+func mediaBlock(p contentPart) (claudecli.Block, error) {
+	switch p.Type {
+	case "image_url":
+		if p.ImageURL == nil {
+			return claudecli.Block{}, fmt.Errorf("image_url part has no image_url")
+		}
+		u := p.ImageURL.URL
+		if strings.HasPrefix(u, "https://") {
+			return claudecli.Block{Kind: claudecli.BlockImage, URL: u}, nil
+		}
+		mediaType, data, err := dataURL(u, imageTypes)
+		if err != nil {
+			return claudecli.Block{}, fmt.Errorf("image_url: %w; send an https URL or a base64 data URL", err)
+		}
+		return claudecli.Block{Kind: claudecli.BlockImage, MediaType: mediaType, Data: data}, nil
+	case "file":
+		if p.File == nil {
+			return claudecli.Block{}, fmt.Errorf("file part has no file")
+		}
+		if p.File.FileData == "" {
+			return claudecli.Block{}, fmt.Errorf("file parts need file_data; file_id is not supported")
+		}
+		mediaType, data, err := dataURL(p.File.FileData, documentTypes)
+		if err != nil {
+			return claudecli.Block{}, fmt.Errorf("file_data: %w", err)
+		}
+		return claudecli.Block{Kind: claudecli.BlockDocument, MediaType: mediaType, Data: data}, nil
+	case "input_audio":
+		return claudecli.Block{}, fmt.Errorf("audio input is not supported")
+	}
+	return claudecli.Block{}, fmt.Errorf("content part type %q is not supported", p.Type)
+}
+
+// dataURL splits a base64 data URL ("data:<media type>;base64,<data>") into
+// its media type and data. The media type must be in allowed and the data
+// must be valid base64: Claude Code turns a bad image into a text note
+// instead of an error.
+func dataURL(u string, allowed map[string]bool) (mediaType, data string, err error) {
+	rest, ok := strings.CutPrefix(u, "data:")
+	if !ok {
+		return "", "", fmt.Errorf("not a data URL")
+	}
+	meta, data, ok := strings.Cut(rest, ",")
+	mediaType, base64Encoded := strings.CutSuffix(meta, ";base64")
+	if !ok || !base64Encoded || data == "" {
+		return "", "", fmt.Errorf("data URL must be base64 encoded")
+	}
+	mediaType = strings.ToLower(mediaType)
+	if !allowed[mediaType] {
+		return "", "", fmt.Errorf("media type %q is not supported (accepted: %s)", mediaType, strings.Join(slices.Sorted(maps.Keys(allowed)), ", "))
+	}
+	if _, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(data))); err != nil {
+		return "", "", fmt.Errorf("data URL has invalid base64 data")
+	}
+	return mediaType, data, nil
 }
 
 // buildTurns converts the conversation to Claude turns. Tool messages and a
@@ -271,16 +380,16 @@ func buildTurns(convo []Message) ([]claudecli.Turn, error) {
 		return &turns[len(turns)-1]
 	}
 	for i, m := range convo {
-		text, err := contentText(m.Content)
+		content, err := contentBlocks(m.Content, m.Role != "assistant")
 		if err != nil {
 			return nil, invalid("messages: %v", err)
 		}
 		switch m.Role {
 		case "user":
 			t := userTurn()
-			t.Text = joinText(t.Text, text)
+			t.Content = appendContent(t.Content, content)
 		case "assistant":
-			t := claudecli.Turn{Role: claudecli.RoleAssistant, Text: text}
+			t := claudecli.Turn{Role: claudecli.RoleAssistant, Content: content}
 			for j, tc := range m.ToolCalls {
 				args := json.RawMessage(tc.Function.Arguments)
 				if strings.TrimSpace(tc.Function.Arguments) == "" {
@@ -296,7 +405,7 @@ func buildTurns(convo []Message) ([]claudecli.Turn, error) {
 				known[tc.ID] = struct{}{}
 				t.ToolCalls = append(t.ToolCalls, claudecli.ToolCall{ID: tc.ID, Name: tc.Function.Name, Input: args})
 			}
-			if t.Text != "" || len(t.ToolCalls) > 0 {
+			if len(t.Content) > 0 || len(t.ToolCalls) > 0 {
 				turns = append(turns, t)
 			}
 		case "tool":
@@ -307,26 +416,26 @@ func buildTurns(convo []Message) ([]claudecli.Turn, error) {
 				return nil, invalid("tool message %d answers unknown tool_call_id %q", i, m.ToolCallID)
 			}
 			t := userTurn()
-			if t.Text != "" {
+			if len(t.Content) > 0 {
 				return nil, invalid("tool message %d must come right after the assistant tool call", i)
 			}
-			t.ToolResults = append(t.ToolResults, claudecli.ToolResult{ToolCallID: m.ToolCallID, Content: text})
+			t.ToolResults = append(t.ToolResults, claudecli.ToolResult{ToolCallID: m.ToolCallID, Content: content})
 		}
 	}
 	for i, t := range turns {
-		if t.Role == claudecli.RoleUser && t.Text == "" && len(t.ToolResults) == 0 {
+		if t.Role == claudecli.RoleUser && len(t.Content) == 0 && len(t.ToolResults) == 0 {
 			return nil, invalid("turn %d: a user message has no content", i)
 		}
 	}
 	return turns, nil
 }
 
-func joinText(a, b string) string {
-	switch {
-	case a == "":
-		return b
-	case b == "":
-		return a
+// appendContent appends the content of a user message to the open user
+// turn. Text that meets text is joined with a blank line.
+func appendContent(dst, src []claudecli.Block) []claudecli.Block {
+	if n := len(dst); n > 0 && len(src) > 0 && dst[n-1].Kind == claudecli.BlockText && src[0].Kind == claudecli.BlockText {
+		dst[n-1].Text += "\n\n" + src[0].Text
+		src = src[1:]
 	}
-	return a + "\n\n" + b
+	return append(dst, src...)
 }
